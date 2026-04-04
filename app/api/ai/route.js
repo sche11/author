@@ -7,6 +7,7 @@ export const maxDuration = 120;
 
 import { applyContentSafety } from '../../lib/content-safety';
 import { proxyFetch } from '../../lib/proxy-fetch';
+import { rotateKey } from '../../lib/keyRotator';
 
 // Function Calling 搜索工具定义
 const WEB_SEARCH_TOOL = {
@@ -30,6 +31,7 @@ const WEB_SEARCH_TOOL = {
 // ===== 内联搜索执行（避免 Edge Runtime 自引用 fetch 问题）=====
 async function executeSearch(query, searchConfig, proxyUrl) {
     const provider = searchConfig.provider || 'tavily';
+    searchConfig.apiKey = rotateKey(searchConfig.apiKey);
     switch (provider) {
         case 'tavily': {
             const tavilyBase = (searchConfig.baseUrl || 'https://api.tavily.com').replace(/\/$/, '');
@@ -64,7 +66,7 @@ export async function POST(request) {
         const { systemPrompt, userPrompt, apiConfig, maxTokens, temperature, topP, reasoningEffort, tools: toolsConfig } = await request.json();
         const proxyUrl = apiConfig?.proxyUrl || '';
 
-        const apiKey = apiConfig?.apiKey || process.env.API_KEY || process.env.ZHIPU_API_KEY;
+        const apiKey = rotateKey(apiConfig?.apiKey || process.env.API_KEY || process.env.ZHIPU_API_KEY);
         const baseUrl = apiConfig?.baseUrl || process.env.API_BASE_URL || 'https://open.bigmodel.cn/api/paas/v4';
         const model = apiConfig?.model || process.env.API_MODEL || 'glm-4-flash';
 
@@ -349,11 +351,13 @@ function streamWithGrounding(upstreamRes, preSources) {
 
                                 // usage 信息
                                 if (json.usage) {
+                                    const cachedTokens = json.usage.prompt_tokens_details?.cached_tokens || 0;
                                     controller.enqueue(encoder.encode(`data: ${JSON.stringify({
                                         usage: {
                                             promptTokens: json.usage.prompt_tokens || 0,
                                             completionTokens: json.usage.completion_tokens || 0,
                                             totalTokens: json.usage.total_tokens || 0,
+                                            cachedTokens,
                                         }
                                     })}\n\n`));
                                 }

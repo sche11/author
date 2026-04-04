@@ -6,13 +6,14 @@ export const maxDuration = 120;
 
 import { applyContentSafety } from '../../../lib/content-safety';
 import { proxyFetch } from '../../../lib/proxy-fetch';
+import { rotateKey } from '../../../lib/keyRotator';
 
 export async function POST(request) {
     try {
         const { systemPrompt, userPrompt, apiConfig, maxTokens, temperature, topP, tools: toolsConfig } = await request.json();
         const proxyUrl = apiConfig?.proxyUrl || '';
 
-        const apiKey = apiConfig?.apiKey || process.env.OPENAI_API_KEY;
+        const apiKey = rotateKey(apiConfig?.apiKey || process.env.OPENAI_API_KEY);
         const baseUrl = (apiConfig?.baseUrl || process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1').replace(/\/$/, '');
         const model = apiConfig?.model || process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
@@ -144,11 +145,13 @@ export async function POST(request) {
                                         // 提取 usage
                                         const usage = json.response?.usage;
                                         if (usage) {
+                                            const cachedTokens = usage.input_tokens_details?.cached_tokens || 0;
                                             controller.enqueue(encoder.encode(`data: ${JSON.stringify({
                                                 usage: {
                                                     promptTokens: usage.input_tokens || 0,
                                                     completionTokens: usage.output_tokens || 0,
                                                     totalTokens: (usage.input_tokens || 0) + (usage.output_tokens || 0),
+                                                    cachedTokens,
                                                 }
                                             })}\n\n`));
                                         }

@@ -10,7 +10,7 @@ import {
     Bell, RotateCcw, Monitor, CircleDot, Smartphone, Clapperboard,
     Heart, Star, Shield, Zap, Feather, Compass, Flag, Tag, Layers,
     Bookmark, Crown, Flame, Lightbulb, Music, Palette, Sword, Target,
-    Moon, Sun, Cloud, TreePine, Mountain, Waves, Building, Car,
+    Moon, Sun, Cloud, CloudOff, TreePine, Mountain, Waves, Building, Car,
     Plus
 } from 'lucide-react';
 import { useAppStore } from '../store/useAppStore';
@@ -31,6 +31,11 @@ import {
     addWork,
     removeWork,
     rebuildAllEmbeddings,
+    addProviderInstance,
+    deleteProviderInstance,
+    setModelParams,
+    getModelParams,
+    getProviderInstances,
 } from '../lib/settings';
 import SettingsTree from './SettingsTree';
 import { useI18n } from '../lib/useI18n';
@@ -325,13 +330,20 @@ export default function SettingsPanel() {
             exportSettingsAsPdf(workNodes);
         } else {
             // JSON 格式
-            const exportNodes = workNodes.map(({ embedding, ...rest }) => rest);
+            const exportNodes = workNodes.filter(n => n.type !== 'work').map(({ embedding, ...rest }) => rest);
+            const itemNodes = workNodes.filter(n => n.type === 'item');
+            const items = itemNodes.map(n => ({
+                name: n.name,
+                category: n.category || 'character',
+                content: n.content || {},
+            }));
             const projectSettings = getProjectSettings();
             const data = {
                 type: 'author-settings-export',
                 version: 2,
                 workName: workEntry.name,
                 exportedAt: new Date().toISOString(),
+                items,
                 nodes: exportNodes,
                 writingMode: projectSettings.writingMode || 'webnovel',
             };
@@ -396,45 +408,81 @@ export default function SettingsPanel() {
         if (ext === 'json') {
             try {
                 const data = JSON.parse(text);
-                if (data.type !== 'author-settings-export' || !Array.isArray(data.nodes)) {
+                if (data.type !== 'author-settings-export') {
                     alert(t('settings.importInvalidFile')); return;
                 }
-                const importedNodes = data.nodes;
-                const importedWorkNode = importedNodes.find(n => n.type === 'work');
-                if (!importedWorkNode) { alert(t('settings.importNoWork')); return; }
-                // 分离 work 节点和子节点
-                const importedSubNodes = importedNodes.filter(n => n.type !== 'work');
 
+                // 恢复项目设置
                 const restorePS = () => {
                     if (data.writingMode) {
                         const ps = getProjectSettings();
-                        if (data.writingMode) ps.writingMode = data.writingMode;
+                        ps.writingMode = data.writingMode;
                         saveProjectSettings(ps); setSettings(ps);
-                        if (data.writingMode) { setWritingModeState(data.writingMode); setWritingMode(data.writingMode); }
+                        setWritingModeState(data.writingMode); setWritingMode(data.writingMode);
                     }
-                    // 兼容旧版导出
-                    if (data.bookInfo && Object.values(data.bookInfo).some(v => v)) {
+                };
+
+                // 优先使用 items 简洁格式，回退到 nodes 格式
+                if (Array.isArray(data.items) && data.items.length > 0) {
+                    // ===== items 格式（新版 / 用户手写） =====
+                    if (!activeWorkId) { alert(t('settings.importNoWork')); return; }
+                    const importedItems = data.items.map(item => ({
+                        name: item.name || '导入条目',
+                        category: item.category || 'character',
+                        content: item.content || {},
+                    }));
+                    // 检测冲突
+                    const existingItems = nodes.filter(n => n.type === 'item' && n.parentId);
+                    const conflicts = [];
+                    const noConflicts = [];
+                    for (const item of importedItems) {
+                        const existing = existingItems.find(n =>
+                            n.name === item.name && n.category === item.category &&
+                            nodes.find(p => p.id === n.parentId && (p.parentId === activeWorkId || p.id === activeWorkId))
+                        );
+                        if (existing) {
+                            conflicts.push({ name: item.name, category: item.category, existing, imported: item });
+                        } else {
+                            noConflicts.push(item);
+                        }
+                    }
+                    restorePS();
+                    if (conflicts.length > 0) {
+                        setConflictData({ conflicts, noConflicts });
+                    } else {
+                        await doImportItems(noConflicts, []);
+                    }
+                } else if (Array.isArray(data.nodes)) {
+                    // ===== nodes 格式（旧版兼容） =====
+                    const importedNodes = data.nodes;
+                    const importedWorkNode = importedNodes.find(n => n.type === 'work');
+                    const workName = importedWorkNode?.name || data.workName || '导入作品';
+                    const importedSubNodes = importedNodes.filter(n => n.type !== 'work');
+
+                    // 兼容旧版 bookInfo
+                    if (data.bookInfo && importedWorkNode && Object.values(data.bookInfo).some(v => v)) {
                         const biNode = importedSubNodes.find(n => n.parentId === importedWorkNode.id && n.category === 'bookInfo');
                         if (biNode && (!biNode.content || Object.keys(biNode.content).length === 0)) {
                             biNode.content = data.bookInfo;
                         }
                     }
-                };
-                const existingWork = works.find(w => w.name === importedWorkNode.name);
-                if (existingWork) {
-                    if (!confirm((t('settings.importOverwrite')).replace('{name}', importedWorkNode.name))) return;
-                    // 覆盖现有作品的节点
-                    await saveSettingsNodes(importedSubNodes, existingWork.id);
-                    restorePS();
-                    setWorks(await getAllWorks());
-                    await handleSwitchWork(existingWork.id);
+
+                    const existingWork = works.find(w => w.name === workName);
+                    if (existingWork) {
+                        if (!confirm((t('settings.importOverwrite')).replace('{name}', workName))) return;
+                        await saveSettingsNodes(importedSubNodes, existingWork.id);
+                        restorePS();
+                        setWorks(await getAllWorks());
+                        await handleSwitchWork(existingWork.id);
+                    } else {
+                        const newWork = await addWork(workName, importedWorkNode?.id);
+                        await saveSettingsNodes(importedSubNodes, newWork.id);
+                        restorePS();
+                        setWorks(await getAllWorks());
+                        await handleSwitchWork(newWork.id);
+                    }
                 } else {
-                    // 创建新作品
-                    const newWork = await addWork(importedWorkNode.name, importedWorkNode.id);
-                    await saveSettingsNodes(importedSubNodes, newWork.id);
-                    restorePS();
-                    setWorks(await getAllWorks());
-                    await handleSwitchWork(newWork.id);
+                    alert(t('settings.importInvalidFile')); return;
                 }
             } catch (err) { alert((t('settings.importError')) + err.message); }
             return;
@@ -1282,7 +1330,7 @@ export const PROVIDERS = [
 ];
 
 function PreferencesForm() {
-    const { language, setLanguage, visualTheme, setVisualTheme, sidebarPushMode, setSidebarPushMode, aiSidebarPushMode, setAiSidebarPushMode } = useAppStore();
+    const { language, setLanguage, visualTheme, setVisualTheme, sidebarPushMode, setSidebarPushMode, aiSidebarPushMode, setAiSidebarPushMode, setShowSyncGuideModal } = useAppStore();
     const { t } = useI18n();
 
     // ---- Firebase 账户 ----
@@ -1410,25 +1458,59 @@ function PreferencesForm() {
             </p>
 
             {/* ===== 云同步账户 ===== */}
-            {firebaseAvailable && (
-                <div style={{ marginBottom: 28, padding: '20px 24px', borderRadius: 'var(--radius-lg)', border: '1px solid var(--border-light)', background: 'var(--bg-secondary)' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16 }}>
-                        <Cloud size={16} style={{ color: 'var(--accent)' }} />
-                        <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-primary)' }}>云同步</span>
-                        {authUser && (
-                            <span style={{
-                                fontSize: 11, padding: '2px 8px', borderRadius: 20,
-                                background: 'rgba(34,197,94,0.1)', color: '#22c55e', fontWeight: 500,
-                                marginLeft: 'auto',
-                            }}>
-                                <CheckCircle2 size={12} style={{ marginRight: 4, verticalAlign: -1 }} />
-                                已连接
-                            </span>
-                        )}
-                    </div>
+            <div style={{ marginBottom: 28, padding: '20px 24px', borderRadius: 'var(--radius-lg)', border: '1px solid var(--border-light)', background: 'var(--bg-secondary)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16 }}>
+                    <Cloud size={16} style={{ color: 'var(--accent)' }} />
+                    <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--text-primary)' }}>云同步</span>
+                    {firebaseAvailable && authUser && (
+                        <span style={{
+                            fontSize: 11, padding: '2px 8px', borderRadius: 20,
+                            background: 'rgba(34,197,94,0.1)', color: '#22c55e', fontWeight: 500,
+                            marginLeft: 'auto',
+                        }}>
+                            <CheckCircle2 size={12} style={{ marginRight: 4, verticalAlign: -1 }} />
+                            已连接
+                        </span>
+                    )}
+                </div>
 
-                    {authUser ? (
-                        /* 已登录状态 */
+                {!firebaseAvailable ? (
+                    /* 未配置 Firebase（本地离线模式） */
+                    <div style={{
+                        padding: '16px 20px', borderRadius: 'var(--radius-md)',
+                        background: 'var(--bg-primary)', border: '1px solid var(--border-light)',
+                        display: 'flex', flexDirection: 'column', gap: 12,
+                    }}>
+                        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 12 }}>
+                            <div style={{ padding: 8, background: 'var(--bg-secondary)', borderRadius: '50%', color: 'var(--text-muted)' }}>
+                                <CloudOff size={20} />
+                            </div>
+                            <div>
+                                <h4 style={{ margin: '0 0 6px 0', fontSize: 13, fontWeight: 600, color: 'var(--text-primary)' }}>本地离线模式</h4>
+                                <p style={{ margin: 0, fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.5 }}>
+                                    当前未配置云同步服务。您的所有数据都安全地保存在浏览器本地，不会上传到任何服务器。
+                                    配置云同步后，可开启多设备之间的自动同步功能。
+                                </p>
+                            </div>
+                        </div>
+                        <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 4 }}>
+                            <button
+                                onClick={() => setShowSyncGuideModal(true)}
+                                style={{
+                                    padding: '6px 14px', fontSize: 12, fontWeight: 500,
+                                    background: 'var(--accent)', color: '#fff', border: 'none',
+                                    borderRadius: 'var(--radius-sm)', cursor: 'pointer',
+                                    transition: 'all 0.2s', boxShadow: '0 2px 8px var(--accent-glow)'
+                                }}
+                                onMouseEnter={e => e.currentTarget.style.transform = 'translateY(-1px)'}
+                                onMouseLeave={e => e.currentTarget.style.transform = 'translateY(0)'}
+                            >
+                                了解如何开启云同步
+                            </button>
+                        </div>
+                    </div>
+                ) : authUser ? (
+                    /* 已登录状态 */
                         <div>
                             <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
                                 {authUser.photoURL ? (
@@ -1569,7 +1651,6 @@ function PreferencesForm() {
                         </div>
                     )}
                 </div>
-            )}
 
             {/* 写作模式选择器 */}
             <div style={{ marginBottom: 28 }}>
@@ -1769,6 +1850,9 @@ function ApiConfigForm({ data, onChange }) {
     const [showEmbedModelModal, setShowEmbedModelModal] = useState(false);
     const [embedModelSearch, setEmbedModelSearch] = useState('');
     const [embedProviderSearch, setEmbedProviderSearch] = useState('');
+    const [showAddInstance, setShowAddInstance] = useState(null); // providerType key or null
+    const [newInstanceName, setNewInstanceName] = useState('');
+    const [editingModelParams, setEditingModelParams] = useState(null); // model id being edited
     const { t } = useI18n();
 
     // 根据 provider 和 apiFormat 获取正确的 baseUrl
@@ -1809,33 +1893,39 @@ function ApiConfigForm({ data, onChange }) {
     const handleDeleteProfile = (id) => { persistProfiles(savedProfiles.filter(p => p.id !== id)); };
 
     const handleProviderChange = (providerKey) => {
-        const provider = PROVIDERS.find(p => p.key === providerKey);
+        // 对于实例 key，通过 providerType 查找预设定义
+        const existingCfg = data.providerConfigs?.[providerKey];
+        const providerType = existingCfg?.providerType || providerKey;
+        const provider = PROVIDERS.find(p => p.key === providerKey) || PROVIDERS.find(p => p.key === providerType);
         if (!provider) return;
 
         // 1. 保存当前供应商配置到 providerConfigs
         const configs = { ...(data.providerConfigs || {}) };
         if (data.provider) {
+            const curType = configs[data.provider]?.providerType || data.provider;
             configs[data.provider] = {
+                ...configs[data.provider],
                 apiKey: data.apiKey || '',
                 baseUrl: data.baseUrl || '',
                 model: data.model || '',
                 apiFormat: data.apiFormat || '',
                 models: data.providerConfigs?.[data.provider]?.models || (data.model ? [data.model] : []),
+                providerType: curType,
             };
         }
 
         // 2. 从 providerConfigs 加载目标供应商已保存的配置
         const saved = configs[providerKey] || {};
         const defaultFormat = provider.defaultFormat || 'openai';
-        const isCustom = ['custom', 'custom-gemini', 'custom-claude'].includes(providerKey);
+        const isCustomTarget = ['custom', 'custom-gemini', 'custom-claude'].includes(providerType);
 
         const newConfig = {
             ...data,
             providerConfigs: configs,
             provider: providerKey,
             apiKey: saved.apiKey || '',
-            baseUrl: isCustom ? (saved.baseUrl || '') : (saved.baseUrl || getBaseUrl(providerKey, provider.supportedFormats ? defaultFormat : undefined)),
-            model: saved.model || (isCustom ? '' : (provider.models[0] || '')),
+            baseUrl: isCustomTarget ? (saved.baseUrl || '') : (saved.baseUrl || getBaseUrl(providerType, provider.supportedFormats ? defaultFormat : undefined)),
+            model: saved.model || (isCustomTarget ? '' : (provider.models[0] || '')),
         };
 
         // 设置 apiFormat
@@ -1863,7 +1953,8 @@ function ApiConfigForm({ data, onChange }) {
     const handleTestConnection = async () => {
         setTestStatus('loading');
         try {
-            const res = await fetch('/api/ai/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ apiConfig: data }) });
+            const pType = instanceCfg?.providerType || data.provider;
+            const res = await fetch('/api/ai/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ apiConfig: { ...data, provider: pType } }) });
             setTestStatus(await res.json());
         } catch { setTestStatus({ success: false, error: t('apiConfig.networkError') }); }
     };
@@ -1871,7 +1962,8 @@ function ApiConfigForm({ data, onChange }) {
     const handleFetchModels = async () => {
         setFetchedModels('loading');
         try {
-            const res = await fetch('/api/ai/models', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ apiKey: data.apiKey, baseUrl: data.baseUrl, provider: data.provider, proxyUrl: data.proxyUrl }) });
+            const pType = instanceCfg?.providerType || data.provider;
+            const res = await fetch('/api/ai/models', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ apiKey: data.apiKey, baseUrl: data.baseUrl, provider: pType, proxyUrl: data.proxyUrl }) });
             const result = await res.json();
             if (result.error) { setFetchedModels(null); setTestStatus({ success: false, error: result.error }); }
             else { setFetchedModels(result.models || []); setShowModelModal(true); setModelSearch(''); }
@@ -1904,8 +1996,11 @@ function ApiConfigForm({ data, onChange }) {
         }
     };
 
-    const currentProvider = PROVIDERS.find(p => p.key === data.provider) || PROVIDERS[7];
-    const isCustom = ['custom', 'custom-gemini', 'custom-claude'].includes(data.provider);
+    // 对于实例 key（如 deepseek_abc），通过 providerType 查找预设定义
+    const instanceCfg = data.providerConfigs?.[data.provider];
+    const resolvedProviderType = instanceCfg?.providerType || data.provider;
+    const currentProvider = PROVIDERS.find(p => p.key === data.provider) || PROVIDERS.find(p => p.key === resolvedProviderType) || PROVIDERS[7];
+    const isCustom = ['custom', 'custom-gemini', 'custom-claude'].includes(resolvedProviderType);
 
     // 嵌入模型供应商
     const EMBED_EXCLUDED = ['deepseek', 'moonshot', 'siliconflow', 'openai-responses', 'openrouter', 'groq', 'mistral', 'cohere', 'together', 'perplexity', 'xai', 'cerebras', 'github', 'stepfun', 'volcengine', 'minimax', 'yi', 'baidu'];
@@ -1987,6 +2082,9 @@ function ApiConfigForm({ data, onChange }) {
                         placeholder="搜索供应商..."
                         value={providerSearch}
                         onChange={e => setProviderSearch(e.target.value)}
+                        autoComplete="off"
+                        data-lpignore="true"
+                        data-1p-ignore="true"
                     />
                     {[
                         { group: '🇨🇳 国内', keys: ['zhipu', 'deepseek', 'bailian', 'volcengine', 'moonshot', 'stepfun', 'yi', 'baichuan', 'hunyuan', 'baidu', 'minimax', 'siliconflow'] },
@@ -2004,45 +2102,127 @@ function ApiConfigForm({ data, onChange }) {
                                 <div className="provider-group-header">{section.group}</div>
                                 {items.map(p => {
                                     const hasKey = !!(data.providerConfigs?.[p.key]?.apiKey || (data.provider === p.key && data.apiKey));
+                                    // 查找该 providerType 的用户实例
+                                    const userInstances = Object.entries(data.providerConfigs || {}).filter(([k, cfg]) =>
+                                        k !== p.key && (cfg.providerType || k) === p.key
+                                    );
                                     return (
-                                        <button
-                                            key={p.key}
-                                            className={`provider-item ${data.provider === p.key ? 'active' : ''}`}
-                                            onClick={() => handleProviderChange(p.key)}
-                                        >
-                                            <span className="provider-item-name">{p.label}</span>
-                                            {hasKey && <span className="provider-item-check"><CheckCircle2 size={12} /></span>}
-                                        </button>
+                                        <div key={p.key}>
+                                            <div style={{ display: 'flex', alignItems: 'center', gap: 0 }}>
+                                                <button
+                                                    className={`provider-item ${data.provider === p.key ? 'active' : ''}`}
+                                                    onClick={() => handleProviderChange(p.key)}
+                                                    style={{ flex: 1 }}
+                                                >
+                                                    <span className="provider-item-name">{p.label}</span>
+                                                    {hasKey && <span className="provider-item-check"><CheckCircle2 size={12} /></span>}
+                                                </button>
+                                                {/* 添加同类型端点按钮（始终显示） */}
+                                                <button
+                                                    style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', fontSize: 14, padding: '4px 6px', lineHeight: 1, flexShrink: 0, opacity: 0.5, transition: 'opacity 0.15s' }}
+                                                    onMouseEnter={e => e.currentTarget.style.opacity = '1'}
+                                                    onMouseLeave={e => e.currentTarget.style.opacity = '0.5'}
+                                                    onClick={(e) => { e.stopPropagation(); setShowAddInstance(p.key); setNewInstanceName(''); }}
+                                                    title="添加同类型端点"
+                                                >+</button>
+                                            </div>
+                                            {/* 用户创建的实例 */}
+                                            {userInstances.map(([instKey, instCfg]) => {
+                                                const instHasKey = !!instCfg.apiKey;
+                                                return (
+                                                    <button
+                                                        key={instKey}
+                                                        className={`provider-item ${data.provider === instKey ? 'active' : ''}`}
+                                                        onClick={() => handleProviderChange(instKey)}
+                                                        style={{ paddingLeft: 24, fontSize: 12 }}
+                                                    >
+                                                        <span className="provider-item-name" style={{ fontSize: 12 }}>↳ {instCfg.instanceName || instKey}</span>
+                                                        {instHasKey && <span className="provider-item-check"><CheckCircle2 size={11} /></span>}
+                                                    </button>
+                                                );
+                                            })}
+                                        </div>
                                     );
                                 })}
                             </div>
                         );
                     })}
+
+                    {/* 添加实例弹窗 */}
+                    {showAddInstance && (
+                        <div style={{ position: 'fixed', inset: 0, zIndex: 10000, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,0.45)' }} onClick={e => { if (e.target === e.currentTarget) setShowAddInstance(null); }}>
+                            <div style={{ background: 'var(--bg-primary)', borderRadius: 'var(--radius-lg, 14px)', boxShadow: '0 16px 48px rgba(0,0,0,0.25)', width: 380, padding: 24 }}>
+                                <div style={{ fontSize: 15, fontWeight: 700, marginBottom: 12 }}>添加 {PROVIDERS.find(p => p.key === showAddInstance)?.label || showAddInstance} 端点</div>
+                                <div style={{ fontSize: 12, color: 'var(--text-muted)', marginBottom: 12 }}>为同一供应商添加不同的 API 地址和密钥（如公司中转站、本地部署等）</div>
+                                <input
+                                    className="modal-input"
+                                    placeholder="端点名称，如：公司内部中转、本地部署..."
+                                    value={newInstanceName}
+                                    onChange={e => setNewInstanceName(e.target.value)}
+                                    autoFocus
+                                    style={{ marginBottom: 12 }}
+                                />
+                                <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+                                    <button className="btn btn-ghost" style={{ fontSize: 12 }} onClick={() => setShowAddInstance(null)}>取消</button>
+                                    <button className="btn btn-primary" style={{ fontSize: 12 }} onClick={() => {
+                                        const name = newInstanceName.trim() || `${PROVIDERS.find(p => p.key === showAddInstance)?.label || showAddInstance} (新)`;
+                                        const newKey = addProviderInstance(showAddInstance, name);
+                                        setShowAddInstance(null);
+                                        // 刷新 data 并切换到新实例
+                                        const settings = getProjectSettings();
+                                        onChange({ ...settings.apiConfig });
+                                        setTimeout(() => handleProviderChange(newKey), 50);
+                                    }}>创建</button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
                 </div>
 
                 {/* 右侧：选中供应商的配置 */}
                 <div className="provider-detail">
                     <div className="provider-detail-header">
-                        <span style={{ fontSize: 15, fontWeight: 600 }}>{currentProvider.label}</span>
-                        <span style={{ fontSize: 11, color: 'var(--text-muted)', fontFamily: 'monospace' }}>{currentProvider.key}</span>
+                        <div style={{ flex: 1 }}>
+                            <span style={{ fontSize: 15, fontWeight: 600 }}>{currentProvider.label}</span>
+                            {instanceCfg?.instanceName && (
+                                <span style={{ fontSize: 12, color: 'var(--accent)', marginLeft: 8, fontWeight: 500 }}>— {instanceCfg.instanceName}</span>
+                            )}
+                            <div>
+                                <span style={{ fontSize: 11, color: 'var(--text-muted)', fontFamily: 'monospace' }}>{data.provider}</span>
+                            </div>
+                        </div>
+                        {/* 实例删除按钮（只对用户创建的实例显示） */}
+                        {instanceCfg?.providerType && data.provider !== instanceCfg.providerType && (
+                            <button
+                                style={{ background: 'none', border: '1px solid var(--error)', borderRadius: 'var(--radius-sm)', color: 'var(--error)', fontSize: 11, padding: '3px 10px', cursor: 'pointer', flexShrink: 0, opacity: 0.7, transition: 'opacity 0.15s' }}
+                                onMouseEnter={e => e.currentTarget.style.opacity = '1'}
+                                onMouseLeave={e => e.currentTarget.style.opacity = '0.7'}
+                                onClick={() => {
+                                    if (!confirm(`确认删除端点「${instanceCfg.instanceName || data.provider}」？`)) return;
+                                    deleteProviderInstance(data.provider);
+                                    const settings = getProjectSettings();
+                                    onChange({ ...settings.apiConfig });
+                                }}
+                            >删除此端点</button>
+                        )}
                     </div>
 
                     {/* 供应商特定提示 */}
-                    {data.provider === 'gemini-native' && (
+                    {resolvedProviderType === 'gemini-native' && (
                         <div className="provider-hint">{t('apiConfig.geminiNativeHint')}</div>
                     )}
-                    {data.provider === 'volcengine' && (
+                    {resolvedProviderType === 'volcengine' && (
                         <div className="provider-hint">火山引擎需要先在控制台创建「推理接入点」，然后将 endpoint_id（如 ep-xxxx）填入模型字段。支持豆包系列模型。</div>
                     )}
-                    {data.provider === 'bailian' && (
+                    {resolvedProviderType === 'bailian' && (
                         <div className="provider-hint">阿里云百炼平台 API Key 在「模型服务灵积」控制台获取，支持通义千问系列模型。</div>
                     )}
-                    {data.provider === 'minimax' && (
+                    {resolvedProviderType === 'minimax' && (
                         <div className="provider-hint">MiniMax API Key 在开放平台获取，支持 abab 系列和 MiniMax-Text 系列模型。</div>
                     )}
 
                     {/* API 格式选择（多格式供应商） */}
-                    {(data.provider === 'bailian' || data.provider === 'minimax') && (
+                    {(resolvedProviderType === 'bailian' || resolvedProviderType === 'minimax') && (
                         <div style={{ marginBottom: 12 }}>
                             <label style={{ display: 'block', fontSize: 12, fontWeight: 500, color: 'var(--text-secondary)', marginBottom: 4 }}>API 格式</label>
                             <div style={{ display: 'flex', gap: 6 }}>
@@ -2091,7 +2271,7 @@ function ApiConfigForm({ data, onChange }) {
                     )}
 
                     {/* API 地址 */}
-                    <FieldInput label={isCustom ? t('apiConfig.apiAddress') : t('apiConfig.apiAddressAuto')} value={data.baseUrl} onChange={v => update('baseUrl', v)} placeholder={data.provider === 'custom-gemini' ? 'https://generativelanguage.googleapis.com/v1beta' : data.provider === 'custom-claude' ? 'https://api.anthropic.com' : t('apiConfig.apiAddressPlaceholder')} />
+                    <FieldInput label={isCustom ? t('apiConfig.apiAddress') : t('apiConfig.apiAddressAuto')} value={data.baseUrl} onChange={v => update('baseUrl', v)} placeholder={resolvedProviderType === 'custom-gemini' ? 'https://generativelanguage.googleapis.com/v1beta' : resolvedProviderType === 'custom-claude' ? 'https://api.anthropic.com' : t('apiConfig.apiAddressPlaceholder')} />
 
                     {/* 代理地址 */}
                     <FieldInput label={<><Globe size={13} style={{ marginRight: 4, verticalAlign: 'text-bottom' }} />代理地址（可选）</>} value={data.proxyUrl || ''} onChange={v => update('proxyUrl', v)} placeholder="http://127.0.0.1:7890" />
@@ -2101,7 +2281,7 @@ function ApiConfigForm({ data, onChange }) {
                             {t('apiConfig.model')}
                         </label>
                         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                            <input className="modal-input" style={{ marginBottom: 0, flex: 1 }} value={data.model || ''} onChange={e => update('model', e.target.value)} placeholder={isCustom ? (data.provider === 'custom-gemini' ? '例如：gemini-2.0-flash' : data.provider === 'custom-claude' ? '例如：claude-sonnet-4-20250514' : '例如：gpt-4o-mini') : '选择或输入模型名称'} />
+                            <input className="modal-input" style={{ marginBottom: 0, flex: 1 }} value={data.model || ''} onChange={e => update('model', e.target.value)} placeholder={isCustom ? (resolvedProviderType === 'custom-gemini' ? '例如：gemini-2.0-flash' : resolvedProviderType === 'custom-claude' ? '例如：claude-sonnet-4-20250514' : '例如：gpt-4o-mini') : '选择或输入模型名称'} />
                             {(isCustom ? (data.apiKey && data.baseUrl) : data.apiKey) && (
                                 <button className="btn btn-ghost btn-sm" style={{ fontSize: 11, whiteSpace: 'nowrap', flexShrink: 0 }} onClick={() => { if (Array.isArray(fetchedModels) && fetchedModels.length > 0) { setShowModelModal(true); setModelSearch(''); } else { handleFetchModels(); } }} disabled={fetchedModels === 'loading'}>
                                     {fetchedModels === 'loading' ? '获取中…' : Array.isArray(fetchedModels) && fetchedModels.length > 0 ? `模型列表 (${fetchedModels.length})` : '获取模型列表'}
@@ -2149,6 +2329,9 @@ function ApiConfigForm({ data, onChange }) {
                                         value={modelSearch}
                                         onChange={e => setModelSearch(e.target.value)}
                                         autoFocus
+                                        autoComplete="off"
+                                        data-lpignore="true"
+                                        data-1p-ignore="true"
                                     />
                                 </div>
                                 {/* 模型列表 */}
@@ -2159,27 +2342,100 @@ function ApiConfigForm({ data, onChange }) {
                                             const savedModels = data.providerConfigs?.[data.provider]?.models || [];
                                             const isInList = savedModels.includes(m.id);
                                             const isActive = data.model === m.id;
+                                            const mParams = getModelParams(data.provider, m.id);
+                                            const hasParams = !!mParams;
+                                            const isEditing = editingModelParams === m.id;
                                             return (
-                                                <div key={m.id} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '7px 10px', borderRadius: 'var(--radius-sm, 6px)', cursor: 'pointer', transition: 'background 0.1s', background: isActive ? 'color-mix(in srgb, var(--accent) 8%, transparent)' : 'transparent' }}
-                                                    onMouseEnter={e => e.currentTarget.style.background = isActive ? 'color-mix(in srgb, var(--accent) 12%, transparent)' : 'var(--bg-secondary)'}
-                                                    onMouseLeave={e => e.currentTarget.style.background = isActive ? 'color-mix(in srgb, var(--accent) 8%, transparent)' : 'transparent'}
-                                                >
-                                                    {/* 勾选框 */}
-                                                    <button style={{ width: 22, height: 22, border: isInList ? '2px solid var(--accent)' : '2px solid var(--border-light)', borderRadius: 4, background: isInList ? 'var(--accent)' : 'transparent', color: '#fff', fontSize: 13, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', flexShrink: 0, transition: 'all 0.15s' }} onClick={() => {
-                                                        const configs = { ...(data.providerConfigs || {}) };
-                                                        if (!configs[data.provider]) configs[data.provider] = {};
-                                                        const models = [...(configs[data.provider].models || [])];
-                                                        if (isInList) {
-                                                            configs[data.provider] = { ...configs[data.provider], models: models.filter(x => x !== m.id) };
-                                                        } else {
-                                                            models.push(m.id);
-                                                            configs[data.provider] = { ...configs[data.provider], models };
-                                                        }
-                                                        onChange({ ...data, providerConfigs: configs });
-                                                    }}>{isInList ? '✓' : ''}</button>
-                                                    {/* 模型名 */}
-                                                    <span style={{ flex: 1, fontFamily: 'monospace', fontSize: 12, color: isActive ? 'var(--accent)' : 'var(--text-primary)', fontWeight: isActive ? 600 : 400, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', cursor: 'pointer' }} onClick={() => { update('model', m.id); }} title={`使用 ${m.id}`}>{m.id}</span>
-                                                    {isActive && <span style={{ fontSize: 10, color: 'var(--accent)', fontWeight: 600, flexShrink: 0 }}>当前</span>}
+                                                <div key={m.id}>
+                                                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '7px 10px', borderRadius: 'var(--radius-sm, 6px)', cursor: 'pointer', transition: 'background 0.1s', background: isActive ? 'color-mix(in srgb, var(--accent) 8%, transparent)' : 'transparent' }}
+                                                        onMouseEnter={e => e.currentTarget.style.background = isActive ? 'color-mix(in srgb, var(--accent) 12%, transparent)' : 'var(--bg-secondary)'}
+                                                        onMouseLeave={e => e.currentTarget.style.background = isActive ? 'color-mix(in srgb, var(--accent) 8%, transparent)' : 'transparent'}
+                                                    >
+                                                        {/* 勾选框 */}
+                                                        <button style={{ width: 22, height: 22, border: isInList ? '2px solid var(--accent)' : '2px solid var(--border-light)', borderRadius: 4, background: isInList ? 'var(--accent)' : 'transparent', color: '#fff', fontSize: 13, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', flexShrink: 0, transition: 'all 0.15s' }} onClick={() => {
+                                                            const configs = { ...(data.providerConfigs || {}) };
+                                                            if (!configs[data.provider]) configs[data.provider] = {};
+                                                            const models = [...(configs[data.provider].models || [])];
+                                                            if (isInList) {
+                                                                configs[data.provider] = { ...configs[data.provider], models: models.filter(x => x !== m.id) };
+                                                            } else {
+                                                                models.push(m.id);
+                                                                configs[data.provider] = { ...configs[data.provider], models };
+                                                            }
+                                                            onChange({ ...data, providerConfigs: configs });
+                                                        }}>{isInList ? '✓' : ''}</button>
+                                                        {/* 模型名 */}
+                                                        <span style={{ flex: 1, fontFamily: 'monospace', fontSize: 12, color: isActive ? 'var(--accent)' : 'var(--text-primary)', fontWeight: isActive ? 600 : 400, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', cursor: 'pointer' }} onClick={() => { update('model', m.id); }} title={`使用 ${m.id}`}>{m.id}</span>
+                                                        {/* 模型参数指示 */}
+                                                        {hasParams && !isEditing && <span style={{ fontSize: 9, color: 'var(--accent)', background: 'color-mix(in srgb, var(--accent) 10%, transparent)', padding: '1px 5px', borderRadius: 3, flexShrink: 0 }}>自定义参数</span>}
+                                                        {/* 齿轮图标 */}
+                                                        <button
+                                                            style={{ background: 'none', border: 'none', cursor: 'pointer', color: isEditing ? 'var(--accent)' : 'var(--text-muted)', fontSize: 14, padding: '2px 4px', flexShrink: 0, opacity: isEditing ? 1 : 0.5, transition: 'all 0.15s' }}
+                                                            onMouseEnter={e => e.currentTarget.style.opacity = '1'}
+                                                            onMouseLeave={e => { if (!isEditing) e.currentTarget.style.opacity = '0.5'; }}
+                                                            onClick={() => setEditingModelParams(isEditing ? null : m.id)}
+                                                            title="模型独立参数"
+                                                        >⚙️</button>
+                                                        {isActive && <span style={{ fontSize: 10, color: 'var(--accent)', fontWeight: 600, flexShrink: 0 }}>当前</span>}
+                                                    </div>
+                                                    {/* 模型级参数编辑面板 */}
+                                                    {isEditing && (() => {
+                                                        const mp = mParams || {};
+                                                        const updateParam = (key, val) => {
+                                                            setModelParams(data.provider, m.id, { [key]: val });
+                                                            // 触发 react 重渲染
+                                                            onChange({ ...data });
+                                                        };
+                                                        const clearParam = (key) => {
+                                                            setModelParams(data.provider, m.id, { [key]: null });
+                                                            onChange({ ...data });
+                                                        };
+                                                        return (
+                                                            <div style={{ margin: '4px 0 8px 32px', padding: '10px 14px', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-sm, 6px)', border: '1px solid var(--border-light)' }}>
+                                                                <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--text-secondary)', marginBottom: 8 }}>模型独立参数（覆盖供应商默认值）</div>
+                                                                {/* Temperature */}
+                                                                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                                                                    <span style={{ fontSize: 11, color: 'var(--text-secondary)', minWidth: 70 }}>Temperature</span>
+                                                                    <input type="range" min="0" max="2" step="0.05" value={mp.temperature ?? 1} onChange={e => updateParam('temperature', parseFloat(e.target.value))} style={{ flex: 1, accentColor: 'var(--accent)', height: 4 }} />
+                                                                    <input type="number" min="0" max="2" step="0.05" value={mp.temperature ?? ''} onChange={e => updateParam('temperature', parseFloat(e.target.value) || 0)} placeholder="默认" style={{ width: 52, padding: '2px 4px', border: '1px solid var(--border-light)', borderRadius: 3, background: 'var(--bg-primary)', fontSize: 11, color: 'var(--text-primary)', textAlign: 'center' }} />
+                                                                    {mp.temperature != null && <button style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', fontSize: 10, padding: 0 }} onClick={() => clearParam('temperature')} title="恢复默认">✕</button>}
+                                                                </div>
+                                                                {/* Top P */}
+                                                                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                                                                    <span style={{ fontSize: 11, color: 'var(--text-secondary)', minWidth: 70 }}>Top P</span>
+                                                                    <input type="range" min="0" max="1" step="0.05" value={mp.topP ?? 0.95} onChange={e => updateParam('topP', parseFloat(e.target.value))} style={{ flex: 1, accentColor: 'var(--accent)', height: 4 }} />
+                                                                    <input type="number" min="0" max="1" step="0.05" value={mp.topP ?? ''} onChange={e => updateParam('topP', parseFloat(e.target.value) || 0)} placeholder="默认" style={{ width: 52, padding: '2px 4px', border: '1px solid var(--border-light)', borderRadius: 3, background: 'var(--bg-primary)', fontSize: 11, color: 'var(--text-primary)', textAlign: 'center' }} />
+                                                                    {mp.topP != null && <button style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', fontSize: 10, padding: 0 }} onClick={() => clearParam('topP')} title="恢复默认">✕</button>}
+                                                                </div>
+                                                                {/* 上下文长度 */}
+                                                                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                                                                    <span style={{ fontSize: 11, color: 'var(--text-secondary)', minWidth: 70 }}>上下文</span>
+                                                                    <input type="number" min="1024" step="1024" value={mp.maxContextLength ?? ''} onChange={e => updateParam('maxContextLength', parseInt(e.target.value) || 4096)} placeholder="默认" style={{ flex: 1, padding: '2px 6px', border: '1px solid var(--border-light)', borderRadius: 3, background: 'var(--bg-primary)', fontSize: 11, color: 'var(--text-primary)' }} />
+                                                                    {mp.maxContextLength != null && <button style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', fontSize: 10, padding: 0 }} onClick={() => clearParam('maxContextLength')} title="恢复默认">✕</button>}
+                                                                </div>
+                                                                {/* 输出 Token */}
+                                                                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                                                                    <span style={{ fontSize: 11, color: 'var(--text-secondary)', minWidth: 70 }}>输出Token</span>
+                                                                    <input type="number" min="256" step="256" value={mp.maxOutputTokens ?? ''} onChange={e => updateParam('maxOutputTokens', parseInt(e.target.value) || 4096)} placeholder="默认" style={{ flex: 1, padding: '2px 6px', border: '1px solid var(--border-light)', borderRadius: 3, background: 'var(--bg-primary)', fontSize: 11, color: 'var(--text-primary)' }} />
+                                                                    {mp.maxOutputTokens != null && <button style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', fontSize: 10, padding: 0 }} onClick={() => clearParam('maxOutputTokens')} title="恢复默认">✕</button>}
+                                                                </div>
+                                                                {/* 思考等级 */}
+                                                                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                                                                    <span style={{ fontSize: 11, color: 'var(--text-secondary)', minWidth: 70 }}>思考等级</span>
+                                                                    <div style={{ display: 'flex', gap: 3, flex: 1 }}>
+                                                                        {[
+                                                                            { key: null, label: '默认' },
+                                                                            { key: 'low', label: 'Low' },
+                                                                            { key: 'medium', label: 'Mid' },
+                                                                            { key: 'high', label: 'High' },
+                                                                        ].map(opt => (
+                                                                            <button key={opt.key ?? 'default'} style={{ padding: '2px 8px', border: (mp.reasoningEffort ?? null) === opt.key ? '1.5px solid var(--accent)' : '1px solid var(--border-light)', borderRadius: 3, background: (mp.reasoningEffort ?? null) === opt.key ? 'color-mix(in srgb, var(--accent) 12%, transparent)' : 'var(--bg-primary)', cursor: 'pointer', fontSize: 10, color: (mp.reasoningEffort ?? null) === opt.key ? 'var(--accent)' : 'var(--text-secondary)' }} onClick={() => opt.key !== null ? updateParam('reasoningEffort', opt.key) : clearParam('reasoningEffort')}>{opt.label}</button>
+                                                                        ))}
+                                                                    </div>
+                                                                </div>
+                                                            </div>
+                                                        );
+                                                    })()}
                                                 </div>
                                             );
                                         })}
@@ -2243,12 +2499,13 @@ function ApiConfigForm({ data, onChange }) {
                                             <button key={opt.key} style={{ padding: '4px 10px', border: (data.searchConfig?.tool || 'tavily') === opt.key ? '2px solid var(--accent)' : '1px solid var(--border-light)', borderRadius: 'var(--radius-sm)', background: (data.searchConfig?.tool || 'tavily') === opt.key ? 'var(--accent-light)' : 'var(--bg-primary)', cursor: 'pointer', fontSize: 11, fontWeight: (data.searchConfig?.tool || 'tavily') === opt.key ? 600 : 400, color: (data.searchConfig?.tool || 'tavily') === opt.key ? 'var(--accent)' : 'var(--text-primary)', transition: 'all 0.15s' }} onClick={() => onChange({ ...data, searchConfig: { ...(data.searchConfig || {}), tool: opt.key } })}>{opt.label}</button>
                                         ))}
                                     </div>
-                                    <FieldInput label={`${(data.searchConfig?.tool || 'Tavily').charAt(0).toUpperCase() + (data.searchConfig?.tool || 'tavily').slice(1)} API Key`} value={data.searchConfig?.apiKey || ''} onChange={v => onChange({ ...data, searchConfig: { ...(data.searchConfig || {}), apiKey: v } })} placeholder={`填入 ${data.searchConfig?.tool || 'Tavily'} API Key`} secret />
+                                    <FieldInput label={`${(data.searchConfig?.tool || 'Tavily').charAt(0).toUpperCase() + (data.searchConfig?.tool || 'tavily').slice(1)} API Key`} value={data.searchConfig?.apiKey || ''} onChange={v => onChange({ ...data, searchConfig: { ...(data.searchConfig || {}), apiKey: v } })} placeholder={`填入 ${data.searchConfig?.tool || 'Tavily'} API Key（多个用逗号分隔可轮询）`} secret />
                                     {!data.searchConfig?.apiKey && (
                                         <div style={{ fontSize: 11, color: 'var(--error)', marginTop: -8, marginBottom: 6, paddingLeft: 2 }}>
                                             <AlertTriangle size={12} style={{ marginRight: 4, verticalAlign: 'text-bottom' }} />当前供应商需要外部搜索 API Key 才能使用联网搜索（<a href={data.searchConfig?.tool === 'exa' ? 'https://exa.ai' : 'https://tavily.com'} target="_blank" rel="noopener noreferrer" style={{ color: 'var(--accent)' }}>点此获取</a>）
                                         </div>
                                     )}
+                                    <FieldInput label={`${(data.searchConfig?.tool || 'Tavily').charAt(0).toUpperCase() + (data.searchConfig?.tool || 'tavily').slice(1)} API 地址`} value={data.searchConfig?.baseUrl || ''} onChange={v => onChange({ ...data, searchConfig: { ...(data.searchConfig || {}), baseUrl: v } })} placeholder={data.searchConfig?.tool === 'exa' ? 'https://api.exa.ai（默认，可留空）' : 'https://api.tavily.com（默认，可留空）'} />
                                 </div>
                             )
                         )}
@@ -2264,7 +2521,7 @@ function ApiConfigForm({ data, onChange }) {
                     </div>
 
                     {/* Reasoning Effort for OpenAI Responses */}
-                    {data.provider === 'openai-responses' && (
+                    {resolvedProviderType === 'openai-responses' && (
                         <div style={{ marginBottom: 12 }}>
                             <label style={{ display: 'block', fontSize: 12, fontWeight: 500, color: 'var(--text-secondary)', marginBottom: 6 }}>思考等级 (Reasoning Effort)</label>
                             <div style={{ display: 'flex', gap: 6 }}>
@@ -2304,54 +2561,93 @@ function ApiConfigForm({ data, onChange }) {
                 <div style={{ padding: '16px', background: 'var(--bg-secondary)', borderRadius: 'var(--radius-md)', marginBottom: 20 }}>
                     {/* Temperature */}
                     <div style={{ marginBottom: 14 }}>
-                        <label style={{ display: 'block', fontSize: 13, fontWeight: 500, color: 'var(--text-secondary)', marginBottom: 5 }}>
+                        <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 13, fontWeight: 500, color: 'var(--text-secondary)', marginBottom: 5 }}>
+                            <input type="checkbox" checked={data.enableTemperature || false} onChange={e => update('enableTemperature', e.target.checked)} style={{ margin: 0 }} />
                             {t('apiConfig.temperature')}
                         </label>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                            <input type="range" min="0" max="2" step="0.05" value={data.temperature ?? 1} onChange={e => update('temperature', parseFloat(e.target.value))} style={{ flex: 1, accentColor: 'var(--accent)' }} />
-                            <input type="number" min="0" max="2" step="0.05" className="modal-input" style={{ width: 72, margin: 0, padding: '5px 8px', fontSize: 13, textAlign: 'center' }} value={data.temperature ?? 1} onChange={e => update('temperature', parseFloat(e.target.value) || 0)} />
-                        </div>
-                        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>{t('apiConfig.temperatureDesc')}</div>
+                        {data.enableTemperature && (
+                            <>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 10, paddingLeft: 22 }}>
+                                    <input type="range" min="0" max="2" step="0.05" value={data.temperature ?? 1} onChange={e => update('temperature', parseFloat(e.target.value))} style={{ flex: 1, accentColor: 'var(--accent)' }} />
+                                    <input type="number" min="0" max="2" step="0.05" className="modal-input" style={{ width: 72, margin: 0, padding: '5px 8px', fontSize: 13, textAlign: 'center' }} value={data.temperature ?? 1} onChange={e => update('temperature', parseFloat(e.target.value) || 0)} />
+                                </div>
+                                <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2, paddingLeft: 22 }}>{t('apiConfig.temperatureDesc')}</div>
+                            </>
+                        )}
                     </div>
 
                     {/* Top P */}
                     <div style={{ marginBottom: 14 }}>
-                        <label style={{ display: 'block', fontSize: 13, fontWeight: 500, color: 'var(--text-secondary)', marginBottom: 5 }}>{t('apiConfig.topP')}</label>
-                        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                            <input type="range" min="0" max="1" step="0.05" value={data.topP ?? 0.95} onChange={e => update('topP', parseFloat(e.target.value))} style={{ flex: 1, accentColor: 'var(--accent)' }} />
-                            <input type="number" min="0" max="1" step="0.05" className="modal-input" style={{ width: 72, margin: 0, padding: '5px 8px', fontSize: 13, textAlign: 'center' }} value={data.topP ?? 0.95} onChange={e => update('topP', parseFloat(e.target.value) || 0)} />
-                        </div>
-                        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>{t('apiConfig.topPDesc')}</div>
+                        <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 13, fontWeight: 500, color: 'var(--text-secondary)', marginBottom: 5 }}>
+                            <input type="checkbox" checked={data.enableTopP || false} onChange={e => update('enableTopP', e.target.checked)} style={{ margin: 0 }} />
+                            {t('apiConfig.topP')}
+                        </label>
+                        {data.enableTopP && (
+                            <>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 10, paddingLeft: 22 }}>
+                                    <input type="range" min="0" max="1" step="0.05" value={data.topP ?? 0.95} onChange={e => update('topP', parseFloat(e.target.value))} style={{ flex: 1, accentColor: 'var(--accent)' }} />
+                                    <input type="number" min="0" max="1" step="0.05" className="modal-input" style={{ width: 72, margin: 0, padding: '5px 8px', fontSize: 13, textAlign: 'center' }} value={data.topP ?? 0.95} onChange={e => update('topP', parseFloat(e.target.value) || 0)} />
+                                </div>
+                                <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2, paddingLeft: 22 }}>{t('apiConfig.topPDesc')}</div>
+                            </>
+                        )}
                     </div>
 
                     {/* 最大上下文长度 */}
                     <div style={{ marginBottom: 14 }}>
-                        <label style={{ display: 'block', fontSize: 13, fontWeight: 500, color: 'var(--text-secondary)', marginBottom: 5 }}>{t('apiConfig.maxContextLength')}</label>
-                        <input type="number" min="1024" step="1024" className="modal-input" style={{ margin: 0, width: 160, padding: '5px 8px', fontSize: 13 }} value={data.maxContextLength ?? 200000} onChange={e => update('maxContextLength', parseInt(e.target.value) || 4096)} />
-                        <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>{t('apiConfig.maxContextLengthDesc')}</div>
+                        <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 13, fontWeight: 500, color: 'var(--text-secondary)', marginBottom: 5 }}>
+                            <input type="checkbox" checked={data.enableMaxContextLength || false} onChange={e => update('enableMaxContextLength', e.target.checked)} style={{ margin: 0 }} />
+                            {t('apiConfig.maxContextLength')}
+                        </label>
+                        {data.enableMaxContextLength && (
+                            <>
+                                <div style={{ paddingLeft: 22 }}>
+                                    <input type="number" min="1024" step="1024" className="modal-input" style={{ margin: 0, width: 160, padding: '5px 8px', fontSize: 13 }} value={data.maxContextLength ?? 200000} onChange={e => update('maxContextLength', parseInt(e.target.value) || 4096)} />
+                                </div>
+                                <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2, paddingLeft: 22 }}>{t('apiConfig.maxContextLengthDesc')}</div>
+                            </>
+                        )}
                     </div>
 
                     {/* 最大输出 Token */}
                     {data.provider !== 'openai-responses' && (
                         <div style={{ marginBottom: 14 }}>
-                            <label style={{ display: 'block', fontSize: 13, fontWeight: 500, color: 'var(--text-secondary)', marginBottom: 5 }}>{t('apiConfig.maxOutputTokens')}</label>
-                            <input type="number" min="256" step="256" className="modal-input" style={{ margin: 0, width: 160, padding: '5px 8px', fontSize: 13 }} value={data.maxOutputTokens ?? 65536} onChange={e => update('maxOutputTokens', parseInt(e.target.value) || 4096)} />
-                            <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>{t('apiConfig.maxOutputTokensDesc')}</div>
+                            <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 13, fontWeight: 500, color: 'var(--text-secondary)', marginBottom: 5 }}>
+                                <input type="checkbox" checked={data.enableMaxOutputTokens || false} onChange={e => update('enableMaxOutputTokens', e.target.checked)} style={{ margin: 0 }} />
+                                {t('apiConfig.maxOutputTokens')}
+                            </label>
+                            {data.enableMaxOutputTokens && (
+                                <>
+                                    <div style={{ paddingLeft: 22 }}>
+                                        <input type="number" min="256" step="256" className="modal-input" style={{ margin: 0, width: 160, padding: '5px 8px', fontSize: 13 }} value={data.maxOutputTokens ?? 65536} onChange={e => update('maxOutputTokens', parseInt(e.target.value) || 4096)} />
+                                    </div>
+                                    <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2, paddingLeft: 22 }}>{t('apiConfig.maxOutputTokensDesc')}</div>
+                                </>
+                            )}
                         </div>
                     )}
 
                     {/* 思考层级 */}
                     {data.provider !== 'openai-responses' && (
                         <div style={{ marginBottom: 14 }}>
-                            <label style={{ display: 'block', fontSize: 13, fontWeight: 500, color: 'var(--text-secondary)', marginBottom: 5 }}>{t('apiConfig.reasoningEffort')}</label>
-                            <select className="modal-input" style={{ margin: 0, width: 160, padding: '5px 8px', fontSize: 13 }} value={data.reasoningEffort || 'auto'} onChange={e => update('reasoningEffort', e.target.value)}>
-                                <option value="auto">{t('apiConfig.reasoningAuto')}</option>
-                                <option value="none">{t('apiConfig.reasoningNone') || '关闭思考'}</option>
-                                <option value="low">Low</option>
-                                <option value="medium">Medium</option>
-                                <option value="high">High</option>
-                            </select>
-                            <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>{t('apiConfig.reasoningEffortDesc')}</div>
+                            <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', fontSize: 13, fontWeight: 500, color: 'var(--text-secondary)', marginBottom: 5 }}>
+                                <input type="checkbox" checked={data.enableReasoningEffort || false} onChange={e => update('enableReasoningEffort', e.target.checked)} style={{ margin: 0 }} />
+                                {t('apiConfig.reasoningEffort')}
+                            </label>
+                            {data.enableReasoningEffort && (
+                                <>
+                                    <div style={{ paddingLeft: 22 }}>
+                                        <select className="modal-input" style={{ margin: 0, width: 160, padding: '5px 8px', fontSize: 13 }} value={data.reasoningEffort || 'auto'} onChange={e => update('reasoningEffort', e.target.value)}>
+                                            <option value="auto">{t('apiConfig.reasoningAuto')}</option>
+                                            <option value="none">{t('apiConfig.reasoningNone') || '关闭思考'}</option>
+                                            <option value="low">Low</option>
+                                            <option value="medium">Medium</option>
+                                            <option value="high">High</option>
+                                        </select>
+                                    </div>
+                                    <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 2, paddingLeft: 22 }}>{t('apiConfig.reasoningEffortDesc')}</div>
+                                </>
+                            )}
                         </div>
                     )}
                 </div>
@@ -2375,6 +2671,9 @@ function ApiConfigForm({ data, onChange }) {
                             placeholder="搜索供应商..."
                             value={embedProviderSearch}
                             onChange={e => setEmbedProviderSearch(e.target.value)}
+                            autoComplete="off"
+                            data-lpignore="true"
+                            data-1p-ignore="true"
                         />
                         {[
                             { group: '🇨🇳 国内', keys: ['zhipu', 'bailian', 'hunyuan', 'baichuan', 'siliconflow'] },
@@ -2474,6 +2773,9 @@ function ApiConfigForm({ data, onChange }) {
                                             value={embedModelSearch}
                                             onChange={e => setEmbedModelSearch(e.target.value)}
                                             autoFocus
+                                            autoComplete="off"
+                                            data-lpignore="true"
+                                            data-1p-ignore="true"
                                         />
                                     </div>
                                     <div style={{ flex: 1, overflowY: 'auto', padding: '4px 12px 12px' }}>
@@ -2544,7 +2846,7 @@ function ApiConfigForm({ data, onChange }) {
                         </button>
                     ) : (
                         <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                            <input className="modal-input" style={{ margin: 0, flex: 1, padding: '7px 10px', fontSize: 13 }} value={profileName} onChange={e => setProfileName(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleSaveProfile()} placeholder={t('apiConfig.saveProfilePlaceholder')} autoFocus />
+                            <input className="modal-input" style={{ margin: 0, flex: 1, padding: '7px 10px', fontSize: 13 }} value={profileName} onChange={e => setProfileName(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleSaveProfile()} placeholder={t('apiConfig.saveProfilePlaceholder')} autoFocus autoComplete="off" data-lpignore="true" data-1p-ignore="true" />
                             <button className="btn btn-primary btn-sm" style={{ padding: '7px 14px', whiteSpace: 'nowrap' }} onClick={handleSaveProfile}>{t('apiConfig.saveBtn')}</button>
                             <button className="btn btn-ghost btn-sm" style={{ padding: '7px 10px' }} onClick={() => setShowSaveInput(false)}>{t('common.cancel')}</button>
                         </div>
@@ -2570,7 +2872,7 @@ function FieldInput({ label, value, onChange, placeholder, multiline, rows, secr
                 <Component
                     className="modal-input"
                     style={{ marginBottom: 0, ...(multiline ? { resize: 'vertical', minHeight: `${(rows || 3) * 22}px` } : {}), ...(secret ? { paddingRight: 36 } : {}) }}
-                    {...(!multiline ? { type: secret && !showSecret ? 'password' : 'text' } : {})}
+                    {...(!multiline ? { type: secret && !showSecret ? 'password' : 'text', autoComplete: secret ? 'new-password' : 'off', 'data-lpignore': 'true', 'data-1p-ignore': 'true' } : {})}
                     value={value || ''}
                     onChange={e => onChange(e.target.value)}
                     placeholder={placeholder}

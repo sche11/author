@@ -1,1 +1,1 @@
-服务端只读环境 500 报错拦截防死循环与构建链发版前缀修缮 | Serverless API Loop Breaker & CI/CD Pipeline Sanitization
+修复存档/读档数据丢失，对话记录不再同步云端 | Fix save/load data loss, chat sessions now local-only

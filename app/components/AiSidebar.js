@@ -12,7 +12,7 @@ import { getProjectSettings, getChatApiConfig, getActiveWorkId, getSettingsNodes
 import { useAppStore } from '../store/useAppStore';
 import ChatMarkdown from './ChatMarkdown';
 import ModelPicker from './ModelPicker';
-import { FolderOpen, Plus, X, Pencil, Trash2, RefreshCw, GitBranch, CornerDownLeft, ClipboardList, Copy, Code2, FileText } from 'lucide-react';
+import { FolderOpen, Plus, X, Pencil, Trash2, RefreshCw, GitBranch, CornerDownLeft, ClipboardList, Copy, Code2, FileText, Maximize2, Minimize2 } from 'lucide-react';
 import { useI18n } from '../lib/useI18n';
 
 /* ---------- 上下文查看器弹窗组件 ---------- */
@@ -385,6 +385,8 @@ export default function AiSidebar({ onInsertText }) {
     const [expandedActions, setExpandedActions] = useState(new Set());
     // 统计刷新版本号
     const [statsVersion, setStatsVersion] = useState(0);
+    // 输入框全屏展开状态
+    const [inputExpanded, setInputExpanded] = useState(false);
 
     const chatEndRef = useRef(null);
     const chatContainerRef = useRef(null);
@@ -484,10 +486,10 @@ export default function AiSidebar({ onInsertText }) {
         const requestBody = {
             systemPrompt, userPrompt, apiConfig,
             ...(apiConfig?.useAdvancedParams ? {
-                maxTokens: apiConfig.maxOutputTokens || 65536,
-                temperature: apiConfig.temperature ?? 1,
-                topP: apiConfig.topP ?? 0.95,
-                reasoningEffort: apiConfig.reasoningEffort || 'auto',
+                ...(apiConfig.enableMaxOutputTokens ? { maxTokens: apiConfig.maxOutputTokens || 65536 } : {}),
+                ...(apiConfig.enableTemperature ? { temperature: apiConfig.temperature ?? 1 } : {}),
+                ...(apiConfig.enableTopP ? { topP: apiConfig.topP ?? 0.95 } : {}),
+                ...(apiConfig.enableReasoningEffort ? { reasoningEffort: apiConfig.reasoningEffort || 'auto' } : {}),
             } : {}),
             ...(toolsPayload ? { tools: toolsPayload } : {}),
         };
@@ -545,6 +547,7 @@ export default function AiSidebar({ onInsertText }) {
                 promptTokens: usageData.promptTokens || 0,
                 completionTokens: usageData.completionTokens || 0,
                 totalTokens: usageData.totalTokens || 0,
+                cachedTokens: usageData.cachedTokens || 0,
                 durationMs,
                 source: 'chat',
                 provider: apiConfig?.provider || 'unknown',
@@ -784,15 +787,54 @@ export default function AiSidebar({ onInsertText }) {
         try {
             const nodes = await getSettingsNodes();
             const workId = getActiveWorkId() || 'work-default';
-            const catToSuffix = { character: 'characters', world: 'world', location: 'locations', object: 'objects', plot: 'plot', rules: 'rules', custom: 'rules' };
-            const suffix = catToSuffix[action.category] || 'rules';
-            let parentId = `${workId}-${suffix}`;
-            const parentNode = nodes.find(n => n.id === parentId);
-            if (!parentNode) parentId = nodes.find(n => n.parentId === workId && n.category === action.category)?.id || parentId;
 
+            // ===== 1. 归一化 category =====
+            // AI 可能输出中文分类名、别名或混写，统一映射到英文标准 key
+            const CATEGORY_ALIASES = {
+                character: 'character', world: 'world', location: 'location',
+                object: 'object', plot: 'plot', rules: 'rules', custom: 'custom',
+                '人物': 'character', '角色': 'character', '人物设定': 'character',
+                '世界': 'world', '世界观': 'world', '世界设定': 'world', '世界观设定': 'world',
+                '地点': 'location', '地点设定': 'location', '场所': 'location', '场景': 'location',
+                '空间': 'location', '地理': 'location',
+                '物品': 'object', '道具': 'object', '物品设定': 'object', '装备': 'object',
+                '大纲': 'plot', '情节': 'plot', '剧情': 'plot', '故事线': 'plot', '故事': 'plot',
+                '规则': 'rules', '写作规则': 'rules', '规范': 'rules',
+                '自定义': 'custom', '其他': 'custom', '补充': 'custom', '补充设定': 'custom',
+                'characters': 'character', 'char': 'character', 'npc': 'character', 'person': 'character',
+                'worlds': 'world', 'worldbuilding': 'world', 'setting': 'world', 'lore': 'world',
+                'locations': 'location', 'place': 'location', 'places': 'location', 'scene': 'location',
+                'objects': 'object', 'item': 'object', 'items': 'object', 'prop': 'object', 'props': 'object',
+                'outline': 'plot', 'story': 'plot', 'storyline': 'plot',
+                'rule': 'rules', 'writing_rules': 'rules',
+            };
+            const rawCat = (action.category || '').toLowerCase().trim();
+            const normalizedCat = CATEGORY_ALIASES[rawCat] || CATEGORY_ALIASES[action.category] || 'custom';
+            action.category = normalizedCat;
+
+            // ===== 2. 查找父文件夹 =====
+            // 优先通过 category 在节点树中搜索（最可靠，不依赖 ID 格式）
+            const catToSuffix = { character: 'characters', world: 'world', location: 'locations', object: 'objects', plot: 'plot', rules: 'rules', custom: 'custom' };
+            let parentNode = nodes.find(n =>
+                n.parentId === workId && n.category === normalizedCat && (n.type === 'folder' || n.type === 'special')
+            );
+            if (!parentNode) {
+                const suffix = catToSuffix[normalizedCat] || 'custom';
+                parentNode = nodes.find(n => n.id === `${workId}-${suffix}`);
+            }
+            if (!parentNode) {
+                parentNode = nodes.find(n => n.parentId === workId && n.category === 'custom' && n.type === 'folder');
+            }
+            const parentId = parentNode?.id || `${workId}-${catToSuffix[normalizedCat] || 'custom'}`;
+
+            // ===== 3. 去重查找 =====
             const resolveNode = () => {
                 if (action.nodeId) return nodes.find(n => n.id === action.nodeId);
-                if (action.name) return nodes.find(n => n.name === action.name && n.category === action.category && n.type === 'item');
+                if (action.name) {
+                    const exact = nodes.find(n => n.name === action.name && n.category === normalizedCat && n.type === 'item');
+                    if (exact) return exact;
+                    return nodes.find(n => n.name === action.name && n.type === 'item');
+                }
                 return null;
             };
 
@@ -802,7 +844,7 @@ export default function AiSidebar({ onInsertText }) {
                     const mergedContent = { ...(existing.content || {}), ...(action.content || {}) };
                     await updateSettingsNode(existing.id, { name: action.name || existing.name, content: mergedContent });
                 } else {
-                    await addSettingsNode({ name: action.name || '新条目', type: 'item', category: action.category || 'custom', parentId, content: action.content || {} });
+                    await addSettingsNode({ name: action.name || '新条目', type: 'item', category: normalizedCat, parentId, content: action.content || {} });
                 }
             } else if (action.action === 'update') {
                 const target = resolveNode();
@@ -812,11 +854,17 @@ export default function AiSidebar({ onInsertText }) {
                     if (action.content) updates.content = { ...(target.content || {}), ...action.content };
                     await updateSettingsNode(target.id, updates);
                 } else {
-                    await addSettingsNode({ name: action.name || '新条目', type: 'item', category: action.category || 'custom', parentId, content: action.content || {} });
+                    await addSettingsNode({ name: action.name || '新条目', type: 'item', category: normalizedCat, parentId, content: action.content || {} });
                 }
             } else if (action.action === 'delete') {
                 const target = resolveNode();
-                if (target) await deleteSettingsNode(target.id);
+                if (target) {
+                    const deletedName = target.name || action.name || '未命名条目';
+                    await deleteSettingsNode(target.id);
+                    showToast(`已删除「${deletedName}」`, 'success');
+                } else {
+                    showToast(`未找到要删除的条目「${action.name || action.nodeId || ''}」`, 'error');
+                }
             }
 
             const msgIdFromKey = actionKey.split('-action-')[0].replace(/-v\d+$/, '');
@@ -830,7 +878,7 @@ export default function AiSidebar({ onInsertText }) {
                 saveSessionStore(newStore);
                 return newStore;
             });
-            showToast('应用设定成功', 'success');
+            if (action.action !== 'delete') showToast('应用设定成功', 'success');
         } catch (err) {
             console.error('Settings action failed:', err);
             showToast('应用操作失败：' + err.message, 'error');
@@ -1455,7 +1503,7 @@ export default function AiSidebar({ onInsertText }) {
                                                                     >
                                                                         <span className="settings-action-badge">{t(`aiSidebar.actions.${action.action}`) || action.action}</span>
                                                                         <span className="settings-action-cat">{t(`aiSidebar.categories.${action.category}`) || action.category || ''}</span>
-                                                                        <span className="settings-action-name">{action.name || action.nodeId || ''}</span>
+                                                                        <span className="settings-action-name">{action.name || (action.nodeId && contextItems?.find(ci => ci._nodeId === action.nodeId)?.name) || ''}</span>
                                                                         <span style={{ marginLeft: 'auto', fontSize: '10px', color: 'var(--text-muted)' }}>{expandedActions.has(actionKey) ? '▲...' : '▼...'}</span>
                                                                     </div>
                                                                     {action.content && expandedActions.has(actionKey) && (
@@ -1468,13 +1516,29 @@ export default function AiSidebar({ onInsertText }) {
                                                                             ))}
                                                                         </div>
                                                                     )}
-                                                                    <button
-                                                                        className="btn-mini primary settings-action-apply"
-                                                                        onClick={() => onApplySettingsAction?.(action, actionKey)}
-                                                                        disabled={msg._appliedActions?.includes(actionKey)}
-                                                                    >
-                                                                        {msg._appliedActions?.includes(actionKey) ? t('aiSidebar.actionsApplied') : t('aiSidebar.actionsApply')}
-                                                                    </button>
+                                                                    <div className="settings-action-buttons" style={{ display: 'flex', gap: '6px', marginTop: '6px' }}>
+                                                                        <button
+                                                                            className="btn-mini primary settings-action-apply"
+                                                                            onClick={() => onApplySettingsAction?.(action, actionKey)}
+                                                                            disabled={msg._appliedActions?.includes(actionKey)}
+                                                                        >
+                                                                            {msg._appliedActions?.includes(actionKey) ? t('aiSidebar.actionsApplied') : t('aiSidebar.actionsApply')}
+                                                                        </button>
+                                                                        <button
+                                                                            className="btn-mini settings-action-delete"
+                                                                            onClick={() => onApplySettingsAction?.({ action: 'delete', category: action.category, name: action.name, nodeId: action.nodeId }, actionKey + '-del')}
+                                                                            title="删除此设定条目"
+                                                                            style={{
+                                                                                background: 'transparent',
+                                                                                border: '1px solid var(--border-color, rgba(200,200,200,0.3))',
+                                                                                color: 'var(--text-secondary)',
+                                                                                display: 'inline-flex', alignItems: 'center', gap: '3px',
+                                                                                cursor: 'pointer', borderRadius: '4px', padding: '3px 8px', fontSize: '11px',
+                                                                            }}
+                                                                        >
+                                                                            <Trash2 size={11} /> {t('aiSidebar.actionsDelete') || '删除'}
+                                                                        </button>
+                                                                    </div>
                                                                 </div>
                                                             );
                                                         }
@@ -1541,21 +1605,36 @@ export default function AiSidebar({ onInsertText }) {
                         {/* 模型切换器 + 输入框 */}
                         <div className="chat-input-area">
                             <div style={{ display: 'flex', gap: 6, flex: 1, alignItems: 'center' }}>
-                                <textarea
-                                    ref={inputRef}
-                                    className="chat-input"
-                                    placeholder={t('aiSidebar.inputPlaceholder')}
-                                    value={inputText}
-                                    onChange={e => setInputText(e.target.value)}
-                                    onKeyDown={e => {
-                                        if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
-                                            e.preventDefault();
-                                            handleSend();
-                                        }
-                                    }}
-                                    disabled={chatStreaming}
-                                    rows={2}
-                                />
+                                <div style={{ flex: 1, position: 'relative', display: 'flex' }}>
+                                    <textarea
+                                        ref={inputRef}
+                                        className="chat-input"
+                                        style={{ paddingRight: 32 }}
+                                        placeholder={t('aiSidebar.inputPlaceholder')}
+                                        value={inputText}
+                                        onChange={e => setInputText(e.target.value)}
+                                        onKeyDown={e => {
+                                            if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
+                                                e.preventDefault();
+                                                handleSend();
+                                            }
+                                        }}
+                                        disabled={chatStreaming}
+                                        rows={2}
+                                    />
+                                    <button
+                                        style={{
+                                            position: 'absolute', right: 4, bottom: 4, background: 'none', border: 'none',
+                                            color: 'var(--text-muted)', cursor: 'pointer', padding: 4,
+                                            display: 'flex', alignItems: 'center', justifyContent: 'center', borderRadius: 'var(--radius-sm)',
+                                        }}
+                                        onClick={() => setInputExpanded(true)}
+                                        title={t('aiSidebar.expandInput') || '全屏输入'}
+                                        disabled={chatStreaming}
+                                    >
+                                        <Maximize2 size={14} />
+                                    </button>
+                                </div>
                                 {chatStreaming ? (
                                     <button
                                         className="chat-send-btn chat-stop-btn"
@@ -1778,6 +1857,12 @@ export default function AiSidebar({ onInsertText }) {
                                                 <div className="stats-card-value">{tokenStats.totalCompletionTokens.toLocaleString()}</div>
                                                 <div className="stats-card-label">{t('aiSidebar.statsTotalOutput')}</div>
                                             </div>
+                                            {tokenStats.totalCachedTokens > 0 && (
+                                                <div className="stats-card stats-card-cached">
+                                                    <div className="stats-card-value">{tokenStats.totalCachedTokens.toLocaleString()}</div>
+                                                    <div className="stats-card-label">{t('aiSidebar.statsCachedTokens')}</div>
+                                                </div>
+                                            )}
                                             <div className="stats-card">
                                                 <div className="stats-card-value">{tokenStats.totalRequests}</div>
                                                 <div className="stats-card-label">{t('aiSidebar.statsTotalRequests')}</div>
@@ -1912,6 +1997,14 @@ export default function AiSidebar({ onInsertText }) {
                                                                     </span>
                                                                     <span className="info-stat-label">In / Out</span>
                                                                 </div>
+                                                                {m.cachedTokens > 0 && (
+                                                                    <div className="info-stat-group" title={t('aiSidebar.statsCachedTokens')}>
+                                                                        <span className="info-stat-value" style={{ color: 'var(--color-success, #22c55e)' }}>
+                                                                            {m.cachedTokens > 1000 ? (m.cachedTokens / 1000).toFixed(1) + 'k' : m.cachedTokens}
+                                                                        </span>
+                                                                        <span className="info-stat-label">Cached</span>
+                                                                    </div>
+                                                                )}
                                                                 {m.avgSpeed > 0 && (
                                                                     <div className="info-stat-group">
                                                                         <span className="info-stat-value">{m.avgSpeed.toFixed(1)}</span>
@@ -1946,6 +2039,61 @@ export default function AiSidebar({ onInsertText }) {
                     )
                 }
             </div >
+
+            {/* 输入框全屏展开弹窗 */}
+            {
+                inputExpanded && (
+                    <div style={{
+                        position: 'fixed', inset: 0, zIndex: 9999,
+                        background: 'rgba(0,0,0,0.5)', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                        backdropFilter: 'blur(3px)'
+                    }} onClick={() => setInputExpanded(false)}>
+                        <div style={{
+                            background: 'var(--bg-primary)', borderRadius: 'var(--radius-lg)',
+                            width: '90%', maxWidth: 800, height: '70vh', minHeight: 400,
+                            padding: '16px 20px', boxShadow: 'var(--shadow-xl)', display: 'flex', flexDirection: 'column', gap: 12
+                        }} onClick={e => e.stopPropagation()}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                                <div style={{ fontSize: 16, fontWeight: 600, color: 'var(--text-primary)', display: 'flex', alignItems: 'center', gap: 6 }}>
+                                    <Maximize2 size={18} /> {t('aiSidebar.expandInputTitle') || '全屏输入'}
+                                </div>
+                                <button onClick={() => setInputExpanded(false)} style={{
+                                    background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', display: 'flex'
+                                }}>✕</button>
+                            </div>
+                            <textarea
+                                className="chat-input"
+                                style={{ flex: 1, resize: 'none', fontSize: 14, padding: 12 }}
+                                placeholder={t('aiSidebar.inputPlaceholder')}
+                                value={inputText}
+                                onChange={e => setInputText(e.target.value)}
+                                onKeyDown={e => {
+                                    if (e.key === 'Enter' && e.ctrlKey && inputText.trim()) {
+                                        e.preventDefault();
+                                        handleSend();
+                                        setInputExpanded(false);
+                                    }
+                                }}
+                                autoFocus
+                            />
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                                <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Ctrl + Enter 单键发送 (Command + Enter)</div>
+                                <div style={{ display: 'flex', gap: 8 }}>
+                                    <button className="btn" onClick={() => setInputExpanded(false)}>取消</button>
+                                    <button
+                                        className="btn primary"
+                                        disabled={!inputText.trim()}
+                                        onClick={() => {
+                                            handleSend();
+                                            setInputExpanded(false);
+                                        }}
+                                    >发送请求</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                )
+            }
 
             {/* 上下文查看器弹窗 */}
             {

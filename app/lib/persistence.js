@@ -223,6 +223,7 @@ const LOCALSTORAGE_KEYS = new Set([
     'author-onboarding-done',
     'author-context-selection',
     'author-api-profiles',
+    'author-api-config',
     'author-delete-never-remind',
     'author-delete-skip-today',
 ]);
@@ -232,6 +233,8 @@ function isSyncableKey(key) {
     if (key === 'author-project-settings') return true; // 全局设置需要同步
     // 本地特有的配置或缓存状态不应该同步到云端（尤其是 API Keys！）
     if (LOCALSTORAGE_KEYS.has(key)) return false;
+    // 对话会话仅本地保存，不同步到云端（体积大 + 隐私敏感）
+    if (key === 'author-chat-sessions') return false;
     // 备份类数据不要同步到云端
     if (key.includes('backup')) return false;
     return true;

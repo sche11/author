@@ -6,6 +6,7 @@ export const maxDuration = 120;
 
 import { applyContentSafety } from '../../../lib/content-safety';
 import { proxyFetch } from '../../../lib/proxy-fetch';
+import { rotateKey } from '../../../lib/keyRotator';
 
 // Anthropic 格式的搜索工具定义
 const WEB_SEARCH_TOOL = {
@@ -23,6 +24,7 @@ const WEB_SEARCH_TOOL = {
 // 内联搜索执行（与 /api/ai/route.js 共享逻辑）
 async function executeSearch(query, searchConfig, proxyUrl) {
     const provider = searchConfig.provider || 'tavily';
+    searchConfig.apiKey = rotateKey(searchConfig.apiKey);
     switch (provider) {
         case 'tavily': {
             const tavilyBase = (searchConfig.baseUrl || 'https://api.tavily.com').replace(/\/$/, '');
@@ -55,7 +57,7 @@ export async function POST(request) {
         const { systemPrompt, userPrompt, apiConfig, maxTokens, temperature, topP, reasoningEffort, tools: toolsConfig } = await request.json();
         const proxyUrl = apiConfig?.proxyUrl || '';
 
-        const apiKey = apiConfig?.apiKey || process.env.CLAUDE_API_KEY;
+        const apiKey = rotateKey(apiConfig?.apiKey || process.env.CLAUDE_API_KEY);
         const baseUrl = (apiConfig?.baseUrl || process.env.CLAUDE_BASE_URL || 'https://api.anthropic.com').replace(/\/$/, '');
         const model = apiConfig?.model || process.env.CLAUDE_MODEL || 'claude-sonnet-4-20250514';
 
@@ -73,10 +75,20 @@ export async function POST(request) {
             'anthropic-version': '2023-06-01',
         };
 
+        // 将 system prompt 转为 content block 格式并启用提示缓存
+        const safeSystemPrompt = applyContentSafety(systemPrompt);
+        const systemBlocks = [
+            {
+                type: 'text',
+                text: safeSystemPrompt,
+                cache_control: { type: 'ephemeral' },
+            }
+        ];
+
         const baseParams = {
             model,
             max_tokens: maxTokens || 8192,
-            system: applyContentSafety(systemPrompt),
+            system: systemBlocks,
             ...(temperature != null ? { temperature } : {}),
             ...(topP != null ? { top_p: topP } : {}),
         };
@@ -199,11 +211,13 @@ export async function POST(request) {
                         controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text: textContent })}\n\n`));
                     }
                     if (round1Data.usage) {
+                        const cachedTokens = (round1Data.usage.cache_read_input_tokens || 0);
                         controller.enqueue(encoder.encode(`data: ${JSON.stringify({
                             usage: {
                                 promptTokens: round1Data.usage.input_tokens || 0,
                                 completionTokens: round1Data.usage.output_tokens || 0,
                                 totalTokens: (round1Data.usage.input_tokens || 0) + (round1Data.usage.output_tokens || 0),
+                                cachedTokens,
                             }
                         })}\n\n`));
                     }
@@ -326,7 +340,7 @@ function streamClaudeResponse(response, sources = null) {
                                     }
                                 }
 
-                                // 消息结束 — 提取 usage
+                                // 消息结束 — 提取 usage（含缓存 token）
                                 if (eventType === 'message_delta') {
                                     const usage = json.usage;
                                     if (usage) {
@@ -340,15 +354,17 @@ function streamClaudeResponse(response, sources = null) {
                                     }
                                 }
 
-                                // message_start 事件中包含 input tokens
+                                // message_start 事件中包含 input tokens + 缓存 tokens
                                 if (eventType === 'message_start') {
                                     const usage = json.message?.usage;
                                     if (usage?.input_tokens) {
+                                        const cachedTokens = usage.cache_read_input_tokens || 0;
                                         controller.enqueue(encoder.encode(`data: ${JSON.stringify({
                                             usage: {
                                                 promptTokens: usage.input_tokens || 0,
                                                 completionTokens: 0,
                                                 totalTokens: usage.input_tokens || 0,
+                                                cachedTokens,
                                             }
                                         })}\n\n`));
                                     }
